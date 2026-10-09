@@ -21,6 +21,14 @@ FROM node:26-alpine AS runner
 RUN apk add --no-cache openssl ca-certificates
 WORKDIR /app
 
+# Versão injetada no build pela tag do release (ver release-and-build.yml)
+ARG APP_VERSION=dev
+LABEL org.opencontainers.image.title="WA-AKG" \
+      org.opencontainers.image.description="Self-hosted WhatsApp Gateway & Dashboard (Next.js + Baileys + Prisma)" \
+      org.opencontainers.image.vendor="Marcelo Matos" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.version="${APP_VERSION}"
+
 COPY --from=builder /app/package*.json ./
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/.next ./.next
