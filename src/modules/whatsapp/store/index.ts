@@ -392,29 +392,66 @@ async function processAndSaveMessage(
         return null;
     }
 
-    // Check if message already exists to avoid duplicates
-    // Baileys 'notify' event can sometimes trigger multiple times or for history
-    // Baileys 'notify' event can sometimes trigger multiple times or for history
-    const existingMessage = await prisma.message.findUnique({
-        where: { sessionId_keyId: { sessionId: dbSessionId, keyId: keyId! } },
-        select: { id: true, status: true }
-    });
-
-    if (existingMessage) {
-        // Message exists! Update status if changed, but DO NOT re-trigger webhooks/bot
-        if (fromMe && existingMessage.status !== 'SENT') {
-            await prisma.message.update({
-                where: { id: existingMessage.id },
-                data: { status: 'SENT' }
-            });
-        }
-        // Return null to indicate "Not New"
-        return null;
-    }
-
     // Debug fromMe issue (Keep this for a while)
     if (fromMe === undefined || fromMe === null) {
         logger.warn("Store", `[DEBUG] Message ${keyId} has fromMe=${fromMe}. Key:`, msg.key);
+    }
+
+    // Determine effective participant for groups
+    // Determine effective participant for groups with standard logic
+    const isGroup = remoteJid.endsWith("@g.us");
+    const remoteJidAlt = msg.key.remoteJidAlt; // LID/Phone JID handling
+    let senderJid = fromMe ? undefined : (isGroup ? (msg.key.participant || msg.participant) : remoteJid);
+
+    // Prefer remoteJidAlt for DMs if available (matches webhook logic)
+    if (!fromMe && !isGroup && remoteJidAlt) {
+        senderJid = remoteJidAlt;
+    }
+
+    // --- Normalize LID JIDs to @s.whatsapp.net ---
+    let normalizedRemoteJid = remoteJid;
+    if (isLidJid(remoteJid)) {
+        normalizedRemoteJid = await resolveToPhoneJid(remoteJid, dbSessionId, remoteJidAlt);
+    }
+    if (senderJid && isLidJid(senderJid)) {
+        senderJid = await resolveToPhoneJid(senderJid, dbSessionId, remoteJidAlt);
+    }
+
+    // Atomically claim this message BEFORE doing any expensive work (media download).
+    // Baileys 'messages.upsert' (notify) and 'messaging-history.set' can both fire for the
+    // same message around a reconnect; a check-then-act "does it exist?" read here is a race
+    // that let both paths pass and download the same media twice. Claiming via create + the
+    // @@unique([sessionId, keyId]) constraint makes only one of them win.
+    let claimedMessage;
+    try {
+        claimedMessage = await prisma.message.create({
+            data: {
+                sessionId: dbSessionId,
+                remoteJid: normalizeJid(normalizedRemoteJid),
+                senderJid,
+                fromMe: fromMe || false,
+                keyId,
+                pushName,
+                timestamp
+            }
+        });
+    } catch (e: any) {
+        if (e?.code === 'P2002') {
+            // Lost the race: another listener already claimed this message.
+            const existingMessage = await prisma.message.findUnique({
+                where: { sessionId_keyId: { sessionId: dbSessionId, keyId: keyId! } },
+                select: { id: true, status: true }
+            });
+            if (existingMessage && fromMe && existingMessage.status !== 'SENT') {
+                await prisma.message.update({
+                    where: { id: existingMessage.id },
+                    data: { status: 'SENT' }
+                });
+            }
+            // Return null to indicate "Not New"
+            return null;
+        }
+        throw e;
     }
 
     const messageContent = normalizeMessageContent(msg.message);
@@ -447,27 +484,6 @@ async function processAndSaveMessage(
         text = messageContent.contactMessage.displayName || "";
     }
 
-    // Determine effective participant for groups
-    // Determine effective participant for groups with standard logic
-    const isGroup = remoteJid.endsWith("@g.us");
-    const remoteJidAlt = msg.key.remoteJidAlt; // LID/Phone JID handling
-    let senderJid = fromMe ? undefined : (isGroup ? (msg.key.participant || msg.participant) : remoteJid);
-
-    // Prefer remoteJidAlt for DMs if available (matches webhook logic)
-    if (!fromMe && !isGroup && remoteJidAlt) {
-        senderJid = remoteJidAlt;
-    }
-
-    // --- Normalize LID JIDs to @s.whatsapp.net ---
-    let normalizedRemoteJid = remoteJid;
-    if (isLidJid(remoteJid)) {
-        normalizedRemoteJid = await resolveToPhoneJid(remoteJid, dbSessionId, remoteJidAlt);
-    }
-    if (senderJid && isLidJid(senderJid)) {
-        senderJid = await resolveToPhoneJid(senderJid, dbSessionId, remoteJidAlt);
-    }
-
-
     // Download Media First (to save URL to DB)
     let fileUrl: string | null = null;
     try {
@@ -493,23 +509,17 @@ async function processAndSaveMessage(
     }
 
     try {
-        const newMessage = await prisma.message.create({
+        const newMessage = await prisma.message.update({
+            where: { id: claimedMessage.id },
             data: {
-                sessionId: dbSessionId,
-                remoteJid: normalizeJid(normalizedRemoteJid),
-                senderJid,
-                fromMe: fromMe || false,
-                keyId,
-                pushName,
                 type: messageType as any,
                 content: text,
                 mediaUrl: fileUrl, // Save Media URL
                 status: fromMe ? "SENT" : "PENDING",
-                timestamp,
                 quoteId
             }
         });
-        
+
         // Ensure contact exists (Upsert Contact)
         const finalRemoteJid = normalizeJid(normalizedRemoteJid);
         if (remoteJid && !remoteJid.includes('@g.us') && !remoteJid.includes('status@broadcast')) {
