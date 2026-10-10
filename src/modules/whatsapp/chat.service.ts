@@ -1,7 +1,7 @@
 import { prisma } from "@/lib/prisma";
 import { normalizeJid } from "@/lib/jid-utils";
 import { waManager } from "@/modules/whatsapp/manager";
-import { onMessageSent } from "@/lib/webhook";
+import { onMessageSent, saveMediaBuffer } from "@/lib/webhook";
 import Sticker from "wa-sticker-formatter";
 
 export class ChatService {
@@ -383,6 +383,10 @@ export class ChatService {
         messageOptions.mimetype = mimetype;
 
         let content: any = {};
+        // The bytes actually sent — same as `buffer` except for stickers, which get
+        // converted to webp first. Used below to save the sent media without re-asking
+        // Baileys to download it.
+        let sentBuffer: Buffer = buffer;
 
         if (type === 'image') {
             content = { image: buffer, ...messageOptions };
@@ -401,7 +405,8 @@ export class ChatService {
                 type: "full",
                 quality: 50
             });
-            content = { sticker: await sticker.toBuffer() };
+            sentBuffer = await sticker.toBuffer();
+            content = { sticker: sentBuffer };
         } else {
             content = { document: buffer, mimetype, fileName, ...messageOptions };
         }
@@ -419,19 +424,44 @@ export class ChatService {
             };
 
             // Map media type to proper message structure for webhook
+            let webhookMediaType: string | null = null;
             if (type === 'image') {
+                webhookMediaType = 'imageMessage';
                 webhookMsg.message = { imageMessage: { caption: caption || "", mimetype } };
             } else if (type === 'video') {
+                webhookMediaType = 'videoMessage';
                 webhookMsg.message = { videoMessage: { caption: caption || "", mimetype } };
             } else if (type === 'audio' || type === 'voice') {
+                webhookMediaType = 'audioMessage';
                 webhookMsg.message = { audioMessage: { mimetype: 'audio/mp4', ptt: type === 'voice' } };
             } else if (type === 'document') {
+                webhookMediaType = 'documentMessage';
                 webhookMsg.message = { documentMessage: { caption: caption || "", fileName, mimetype } };
             } else if (type === 'sticker') {
+                webhookMediaType = 'stickerMessage';
                 webhookMsg.message = { stickerMessage: {} };
             }
 
-            onMessageSent(sessionId, webhookMsg).catch(e => console.error("Webhook error:", e));
+            // We already have the plaintext buffer we just sent — save it directly instead
+            // of asking Baileys to download it from this synthetic message (which has no
+            // real mediaKey/url, so that download always failed with "message is not a
+            // media message").
+            let fileUrl: string | null = null;
+            const sentKeyId = sendResult?.key?.id;
+            if (webhookMediaType && sentKeyId) {
+                try {
+                    // Read the mimetype back from the webhook message itself, so the saved
+                    // file's extension always matches what was actually declared/sent
+                    // (e.g. audio/voice hardcode audio/mp4 regardless of the caller's
+                    // original mimetype; stickers have none — fall back to extMap's webp).
+                    const savedMimetype = webhookMsg.message?.[webhookMediaType]?.mimetype;
+                    fileUrl = await saveMediaBuffer(sentBuffer, sessionId, sentKeyId, webhookMediaType, savedMimetype);
+                } catch (e) {
+                    console.error("Failed to save sent media buffer:", e);
+                }
+            }
+
+            onMessageSent(sessionId, webhookMsg, fileUrl).catch(e => console.error("Webhook error:", e));
         } catch (e) {
             // Non-blocking
         }
