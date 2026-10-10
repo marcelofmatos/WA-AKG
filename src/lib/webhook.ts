@@ -368,6 +368,44 @@ export async function testWebhook(webhookId: string, url: string, secret?: strin
 }
 
 /**
+ * Save an already-decrypted media buffer to disk and return its serving URL.
+ * Shared by downloadAndSaveMedia (incoming/received media) and by send paths that
+ * already have the plaintext buffer they just sent, so they don't need to ask
+ * Baileys to download it back.
+ */
+export async function saveMediaBuffer(
+    buffer: Buffer,
+    sessionId: string,
+    keyId: string,
+    messageType: string,
+    mimetype?: string
+): Promise<string> {
+    const extMap: Record<string, string> = {
+        imageMessage: 'jpg',
+        videoMessage: 'mp4',
+        audioMessage: 'mp3',
+        documentMessage: 'bin',
+        stickerMessage: 'webp'
+    };
+
+    let ext = extMap[messageType] || 'bin';
+    if (mimetype) {
+        const mimeExt = mimetype.split('/')[1]?.split(';')[0];
+        if (mimeExt) ext = mimeExt;
+    }
+
+    const filename = `${sessionId}-${keyId}.${ext}`;
+    const filePath = path.join(process.cwd(), "data", "media", filename);
+
+    await mkdir(path.dirname(filePath), { recursive: true });
+    await writeFile(filePath, buffer);
+
+    const fileUrl = `/api/media/${filename}`;
+    logger.success("Media", `Success. URL: ${fileUrl}`);
+    return fileUrl;
+}
+
+/**
  * Helper to download and save media
  */
 export async function downloadAndSaveMedia(message: WAMessage, sessionId: string): Promise<string | null> {
@@ -437,36 +475,7 @@ export async function downloadAndSaveMedia(message: WAMessage, sessionId: string
 
         logger.success("Media", `Downloaded ${buffer.length} bytes.`);
 
-        // Generate filename
-        const extMap: Record<string, string> = {
-            imageMessage: 'jpg',
-            videoMessage: 'mp4',
-            audioMessage: 'mp3',
-            documentMessage: 'bin',
-            stickerMessage: 'webp'
-        };
-
-        let ext = extMap[messageType] || 'bin';
-
-        // Try to get extension from mimetype if available
-        const mime = (messageContent as any)[messageType]?.mimetype;
-        if (mime) {
-            const mimeExt = mime.split('/')[1]?.split(';')[0];
-            if (mimeExt) ext = mimeExt;
-        }
-
-        const filename = `${sessionId}-${message.key.id}.${ext}`;
-        const filePath = path.join(process.cwd(), "data", "media", filename);
-
-        // Ensure directory exists (redundant if handled by OS, but safe)
-        await mkdir(path.dirname(filePath), { recursive: true });
-
-        await writeFile(filePath, buffer);
-
-        // Return URL path using API route for reliable serving
-        const fileUrl = `/api/media/${filename}`;
-        logger.success("Media", `Success. URL: ${fileUrl}`);
-        return fileUrl;
+        return await saveMediaBuffer(buffer, sessionId, message.key.id!, messageType, mediaObj?.mimetype);
 
     } catch (e) {
         logger.error("Media", "Failed to download media:", e);
